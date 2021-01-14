@@ -3,29 +3,25 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/ascii85"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
 	"os"
-	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v4/pgxpool"
 )
 
 const (
-	BATCH_SIZE          = 10_000
+	BATCH_SIZE          = 60_000
 	DATE_FORMAT         = "January 2 2006"
-	HIBP_TABLE_SCHEMA   = `CREATE TABLE IF NOT EXISTS hibp (hibp_id CHAR(40) NOT NULL PRIMARY KEY, password VARCHAR(200), count INT)`
-	TASKS_TABLE_SCHEMA  = `CREATE TABLE IF NOT EXISTS tasks (task_id serial PRIMARY KEY, name VARCHAR(150) NOT NULL, description TEXT)`
+	HIBP_TABLE_SCHEMA   = `CREATE TABLE IF NOT EXISTS hibp (hibp_id CHAR(25) NOT NULL PRIMARY KEY, password VARCHAR(150))`
 	IMPORT_TABLE_SCHEMA = `CREATE TABLE IF NOT EXISTS imports (import_id serial PRIMARY KEY, name VARCHAR(200) NOT NULL, state VARCHAR(50) NOT NULL, import_date DATE NOT NULL)`
 )
-
-type hibpData struct {
-	hash  string
-	count int
-}
 
 type hibpPasswordData struct {
 	hash     string
@@ -64,7 +60,7 @@ func stringToDate(date string) time.Time {
 func hibpEtl(connectionString, filename, date string) int {
 	var count int
 	var errors int
-	rowData := make([]hibpData, 0, BATCH_SIZE)
+	rowData := make([]string, 0, BATCH_SIZE)
 
 	time := stringToDate(date)
 
@@ -92,28 +88,32 @@ func hibpEtl(connectionString, filename, date string) int {
 			errors++
 			continue
 		}
-		var numCount, err = strconv.Atoi(data[1])
+		hash, err := hex.DecodeString(data[0])
 		if err != nil {
 			errors++
 			continue
 		}
-		hash := strings.ToLower(data[0])
+		hibpLen := ascii85.MaxEncodedLen(len(hash))
+		hibp_id := make([]byte, hibpLen)
+
+		bytesWritten := ascii85.Encode(hibp_id, hash)
+		hibp := string(hibp_id[0:bytesWritten])
+		if !utf8.ValidString(hibp) {
+			log.Fatal("Warning not a string %v", hibp)
+		}
 		count++
-
-		row := hibpData{hash, numCount}
-		rowData = append(rowData, row)
-
+		rowData = append(rowData, hibp)
 		if count%BATCH_SIZE == 0 {
 			log.Printf("processing %d...", count)
-			errors += hibpProcessRowDataBatch(rowData, dbPool)
-			rowData = make([]hibpData, 0, BATCH_SIZE)
+			errors += hibpProcessRowDataBatch(dbPool, rowData)
+			rowData = make([]string, 0, BATCH_SIZE)
 		}
 	}
 	err = s.Err()
 	if err != nil {
 		log.Fatal(err)
 	}
-	errors += hibpProcessRowDataBatch(rowData, dbPool)
+	errors += hibpProcessRowDataBatch(dbPool, rowData)
 
 	var state string
 	if errors > 0 {
@@ -128,21 +128,20 @@ func hibpEtl(connectionString, filename, date string) int {
 	return count
 }
 
-func hibpProcessRowDataBatch(rowData []hibpData, dbPool *pgxpool.Pool) int {
+func hibpProcessRowDataBatch(dbPool *pgxpool.Pool, rowData []string) int {
 	var errors int
 	values := []string{}
 	args := []interface{}{}
 
 	for i, row := range rowData {
-		values = append(values, fmt.Sprintf("($%d, $%d)", i*2+1, i*2+2))
-		args = append(args, row.hash)
-		args = append(args, row.count)
+		values = append(values, fmt.Sprintf("($%d)", i+1))
+		args = append(args, row)
 	}
-	query := fmt.Sprintf("INSERT INTO hibp (hibp_id, count) VALUES %s ON CONFLICT (hibp_id) DO UPDATE SET count = EXCLUDED.count",
+	query := fmt.Sprintf("INSERT INTO hibp (hibp_id) VALUES %s ON CONFLICT (hibp_id) DO NOTHING",
 		strings.Join(values, ","))
 	_, err := dbPool.Exec(context.Background(), query, args...)
 	if err != nil {
-		log.Printf("Err: %v on %s", err, query)
+		log.Printf("Err: %v on %s: %v", err, query, args)
 		errors++
 	}
 	return errors
